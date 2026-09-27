@@ -40,21 +40,64 @@ jobs:
 
       - name: Retrieve PR metadata
         id: pr
-        shell: bash
-        run: |
-          number=$(head -n1 shape-builder-preview/pr/number | tr -d '[:space:]')
-          case "$number" in
-            ''|*[!0-9]*) echo "::error::invalid PR number"; exit 1 ;;
-          esac
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const fs = require("fs");
+            const metadataDirectory = "shape-builder-preview/pr";
+            const readMetadata = (name) =>
+              fs.readFileSync(`${metadataDirectory}/${name}`, "utf8").trim();
 
-          action=$(head -n1 shape-builder-preview/pr/action | tr -d '[:space:]')
-          case "$action" in
-            opened|reopened|synchronize|closed) ;;
-            *) echo "::error::invalid action: $action"; exit 1 ;;
-          esac
+            const numberText = readMetadata("number");
+            const pullNumber = Number(numberText);
+            if (!/^\d+$/.test(numberText) || !Number.isSafeInteger(pullNumber) || pullNumber < 1) {
+              core.setFailed("Invalid PR number in preview artifact");
+              return;
+            }
 
-          echo "PULL_REQUEST=$number" >> "$GITHUB_OUTPUT"
-          echo "ACTION=$action" >> "$GITHUB_OUTPUT"
+            const action = readMetadata("action");
+            const allowedActions = new Set(["opened", "reopened", "synchronize", "closed"]);
+            if (!allowedActions.has(action)) {
+              core.setFailed(`Invalid PR action in preview artifact: ${action}`);
+              return;
+            }
+
+            const artifactSha = readMetadata("sha");
+            const workflowRun = context.payload.workflow_run;
+            if (workflowRun.event !== "pull_request") {
+              core.setFailed(`Unexpected triggering event: ${workflowRun.event}`);
+              return;
+            }
+            if (artifactSha !== workflowRun.head_sha) {
+              core.setFailed("Artifact SHA does not match the triggering workflow run");
+              return;
+            }
+
+            const { data: pullRequest } = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: pullNumber,
+            });
+
+            const workflowHeadRepository = workflowRun.head_repository?.full_name;
+            if (
+              pullRequest.head.sha !== workflowRun.head_sha ||
+              pullRequest.head.repo?.full_name !== workflowHeadRepository
+            ) {
+              core.setFailed("Artifact PR does not own the triggering workflow run");
+              return;
+            }
+
+            const expectedState = action === "closed" ? "closed" : "open";
+            if (pullRequest.state !== expectedState) {
+              core.setFailed(
+                `PR state ${pullRequest.state} is inconsistent with artifact action ${action}`
+              );
+              return;
+            }
+
+            core.setOutput("PULL_REQUEST", numberText);
+            core.setOutput("ACTION", action);
 
   deploy:
     needs: read-metadata
@@ -102,7 +145,7 @@ jobs:
               || format('Preview deployment: {0}', steps.preview.outputs.preview-url) }}
 
   prune:
-    needs: read-metadata
+    needs: [read-metadata, deploy]
     if: needs.read-metadata.outputs.action != 'closed'
     runs-on: ubuntu-24.04
     steps:
@@ -128,6 +171,7 @@ jobs:
           echo "removed_prs_json=[]" >> "$GITHUB_OUTPUT"
           attempts=5
           removed_prs=()
+          push_succeeded=false
 
           for attempt in $(seq 1 "$attempts"); do
             git fetch --quiet origin gh-pages
@@ -152,18 +196,25 @@ jobs:
             fi
 
             if git diff --quiet -- pr-preview; then
+              push_succeeded=true
               break
             fi
 
             git add pr-preview
             git commit --quiet -m "Prune old PR previews"
             if git push origin HEAD:gh-pages; then
+              push_succeeded=true
               break
             fi
 
             echo "Prune push lost the race (attempt ${attempt}/${attempts}); retrying."
             sleep "$(( attempt * 5 ))"
           done
+
+          if [ "$push_succeeded" != true ]; then
+            echo "::error::Unable to push preview pruning after ${attempts} attempts"
+            exit 1
+          fi
 
           if [ "${#removed_prs[@]}" -gt 0 ]; then
             echo "removed_prs_json=$(printf '%s\n' "${removed_prs[@]}" | jq -R . | jq -sc .)" >> "$GITHUB_OUTPUT"
